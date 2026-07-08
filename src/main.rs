@@ -75,6 +75,12 @@ fn collect_rows(
         .as_ref()
         .map(|c| c.hbm_gib as f64 * GIB)
         .unwrap_or(0.0);
+    // 每芯片 core 数(v6e=1, v7x=2):chip = core_id / cpc
+    let cpc = if info.chips > 0 {
+        (info.cores / info.chips).max(1)
+    } else {
+        1
+    } as i64;
 
     let mut rows = Vec::new();
     let mut any_metrics = false;
@@ -132,6 +138,7 @@ fn collect_rows(
             rows.push(DevRow {
                 host: host_label.clone(),
                 dev,
+                chip: dev / cpc,
                 pid,
                 used,
                 total,
@@ -240,27 +247,41 @@ fn print_once(cli: &Cli, addrs: &[String], rt: &tokio::runtime::Runtime) {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
+    let chip_rows = ui::group_by_chip(&rows);
+    let multi_core = chip_rows.iter().any(|c| c.cores.len() > 1);
     let mut header: Vec<&str> = vec![];
     if multi {
         header.push("Host");
     }
-    header.extend(["Core", "PID", "HBM used/total (GiB)", "TC Util%"]);
+    header.extend(["Chip", "PID", "HBM used/total (GiB)"]);
+    header.push(if multi_core { "TC Util% /core" } else { "TC Util%" });
     table.set_header(header);
 
-    for r in &rows {
+    for c in &chip_rows {
         let mut cells: Vec<String> = vec![];
         if multi {
-            cells.push(r.host.clone());
+            cells.push(c.host.clone());
         }
-        cells.push(r.dev.to_string());
-        cells.push(r.pid.clone());
-        if r.metrics_ok {
-            cells.push(format!("{:.1}/{:.0} GiB", r.used / GIB, r.total / GIB));
-            cells.push(format!("{:.1}", r.duty));
+        cells.push(c.chip.to_string());
+        cells.push(c.pid.clone());
+        if c.metrics_ok {
+            cells.push(format!("{:.1}/{:.0} GiB", c.used / GIB, c.total / GIB));
+            let txt = c
+                .cores
+                .iter()
+                .map(|(id, d)| if multi_core { format!("c{id}:{d:.0}") } else { format!("{d:.0}") })
+                .collect::<Vec<_>>()
+                .join("  ");
+            cells.push(txt);
         } else {
-            // 空闲:HBM 总量用静态值,其余按 0
-            cells.push(format!("—/{:.0} GiB", r.total / GIB));
-            cells.push("0".into());
+            cells.push(format!("—/{:.0} GiB", c.total / GIB));
+            let txt = c
+                .cores
+                .iter()
+                .map(|(id, _)| if multi_core { format!("c{id}:0") } else { "0".into() })
+                .collect::<Vec<_>>()
+                .join("  ");
+            cells.push(txt);
         }
         table.add_row(cells);
     }

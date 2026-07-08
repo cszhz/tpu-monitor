@@ -15,11 +15,53 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 pub struct DevRow {
     pub host: String,
     pub dev: i64,
+    pub chip: i64,
     pub pid: String,
     pub used: f64,
     pub total: f64,
     pub duty: f64,
     pub metrics_ok: bool,
+}
+
+/// 按芯片聚合后的行:HBM 每芯片一次(2 core 共享),duty 保留每 core。
+pub struct ChipRow {
+    pub host: String,
+    pub chip: i64,
+    pub pid: String,
+    pub used: f64,
+    pub total: f64,
+    pub metrics_ok: bool,
+    pub cores: Vec<(i64, f64)>, // (core_id, duty%)
+}
+
+/// 把每 core 的 DevRow 聚合成每芯片的 ChipRow(保序)。
+pub fn group_by_chip(rows: &[DevRow]) -> Vec<ChipRow> {
+    let mut out: Vec<ChipRow> = Vec::new();
+    for r in rows {
+        match out.iter_mut().find(|c| c.chip == r.chip && c.host == r.host) {
+            Some(c) => {
+                if c.pid == "-" && r.pid != "-" {
+                    c.pid = r.pid.clone();
+                }
+                if r.metrics_ok {
+                    c.metrics_ok = true;
+                    c.used = c.used.max(r.used);
+                    c.total = c.total.max(r.total);
+                }
+                c.cores.push((r.dev, r.duty));
+            }
+            None => out.push(ChipRow {
+                host: r.host.clone(),
+                chip: r.chip,
+                pid: r.pid.clone(),
+                used: r.used,
+                total: r.total,
+                metrics_ok: r.metrics_ok,
+                cores: vec![(r.dev, r.duty)],
+            }),
+        }
+    }
+    out
 }
 
 pub struct App {
@@ -228,53 +270,71 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_table(f: &mut Frame, area: Rect, app: &App) {
+    let chips = group_by_chip(&app.rows);
+    let multi_core = chips.iter().any(|c| c.cores.len() > 1);
+
     let mut headers: Vec<&str> = vec![];
     if app.multi_host {
         headers.push("HOST");
     }
-    headers.extend(["CORE", "PID", "HBM", "USED/TOTAL", "TC Util"]);
+    headers.push("CHIP");
+    headers.extend(["PID", "HBM", "USED/TOTAL"]);
+    headers.push(if multi_core { "TC Util /core" } else { "TC Util" });
     let header = Row::new(
         headers
             .into_iter()
             .map(|h| Cell::from(h).style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD))),
     )
-    .height(1)
-    .bottom_margin(0);
+    .height(1);
 
-    let rows: Vec<Row> = app
-        .rows
+    let rows: Vec<Row> = chips
         .iter()
         .enumerate()
-        .map(|(idx, r)| {
-            let hbm_pct = if r.total > 0.0 { r.used / r.total * 100.0 } else { 0.0 };
+        .map(|(idx, c)| {
+            let hbm_pct = if c.total > 0.0 { c.used / c.total * 100.0 } else { 0.0 };
             let mut cells: Vec<Cell> = vec![];
             if app.multi_host {
-                cells.push(Cell::from(r.host.clone()).style(Style::default().fg(Color::Gray)));
+                cells.push(Cell::from(c.host.clone()).style(Style::default().fg(Color::Gray)));
             }
-            cells.push(Cell::from(r.dev.to_string()).style(Style::default().fg(ACCENT)));
-            cells.push(Cell::from(r.pid.clone()).style(Style::default().fg(Color::Gray)));
+            cells.push(Cell::from(c.chip.to_string()).style(Style::default().fg(ACCENT)));
+            cells.push(Cell::from(c.pid.clone()).style(Style::default().fg(Color::Gray)));
 
-            if r.metrics_ok {
-                // HBM 进度条 + 用量文本
+            if c.metrics_ok {
                 cells.push(
-                    Cell::from(format!("{} {:>3.0}%", bar(hbm_pct, 10), hbm_pct))
+                    Cell::from(format!("{} {:>3.0}%", bar(hbm_pct, 8), hbm_pct))
                         .style(Style::default().fg(util_color(hbm_pct))),
                 );
                 cells.push(
-                    Cell::from(format!("{:.1}/{:.0} GiB", r.used / GIB, r.total / GIB))
+                    Cell::from(format!("{:.1}/{:.0} GiB", c.used / GIB, c.total / GIB))
                         .style(Style::default().fg(Color::Gray)),
                 );
-                cells.push(
-                    Cell::from(format!("{} {:>3.0}%", bar(r.duty, 8), r.duty))
-                        .style(Style::default().fg(util_color(r.duty))),
-                );
+                // 每 core 的 duty
+                let txt = c
+                    .cores
+                    .iter()
+                    .map(|(id, d)| {
+                        if multi_core {
+                            format!("c{id}:{d:>3.0}%")
+                        } else {
+                            format!("{d:>3.0}%")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                let maxd = c.cores.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
+                cells.push(Cell::from(txt).style(Style::default().fg(util_color(maxd))));
             } else {
-                // 空闲:用静态值占位,整行灰显
-                cells.push(Cell::from(format!("{}   0%", bar(0.0, 10))).style(Style::default().fg(DIM)));
-                cells.push(
-                    Cell::from(format!("—/{:.0} GiB", r.total / GIB)).style(Style::default().fg(DIM)),
-                );
                 cells.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(Style::default().fg(DIM)));
+                cells.push(
+                    Cell::from(format!("—/{:.0} GiB", c.total / GIB)).style(Style::default().fg(DIM)),
+                );
+                let txt = c
+                    .cores
+                    .iter()
+                    .map(|(id, _)| if multi_core { format!("c{id}:  0%") } else { "  0%".into() })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                cells.push(Cell::from(txt).style(Style::default().fg(DIM)));
             }
 
             let base = if idx % 2 == 1 {
@@ -291,17 +351,17 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
         widths.push(Constraint::Length(18));
     }
     widths.extend([
-        Constraint::Length(4),  // DEV
+        Constraint::Length(5),  // CHIP
         Constraint::Length(8),  // PID
-        Constraint::Length(16), // HBM bar
+        Constraint::Length(14), // HBM bar
         Constraint::Length(14), // used/total
-        Constraint::Length(14), // TC Util bar
+        Constraint::Min(16),    // TC Util per core
     ]);
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .block(block(" Devices "));
+        .block(block(" Chips (per-core TC Util) "));
     f.render_widget(table, area);
 }
 
