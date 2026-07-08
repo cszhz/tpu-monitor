@@ -394,6 +394,17 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     if cli.raw {
+        // 探测每个 addr 的连接结果(诊断多端点用)
+        for a in &addrs {
+            match rt.block_on(metrics::fetch(a)) {
+                Ok(u) => println!(
+                    "[probe] {a}: OK  usage_entries={} total_entries={}",
+                    u.usage.len(),
+                    u.total.len()
+                ),
+                Err(e) => println!("[probe] {a}: ERR {e}"),
+            }
+        }
         let (rows, _, _, _, _, _) = collect_rows(&addrs, &rt);
         println!("core  chip  used_GiB  total_GiB  duty%  ok");
         for r in &rows {
