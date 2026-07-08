@@ -78,6 +78,8 @@ pub struct App {
     pub io: IoStats,
     pub uptime_secs: f64,
     pub slice_error: f64,
+    pub selected: usize,                          // 当前选中的芯片行
+    pub expanded: std::collections::HashSet<i64>, // 已展开的芯片(chip id)
 }
 
 fn fmt_uptime(secs: f64) -> String {
@@ -271,15 +273,16 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_table(f: &mut Frame, area: Rect, app: &App) {
     let chips = group_by_chip(&app.rows);
-    let multi_core = chips.iter().any(|c| c.cores.len() > 1);
+    let gray = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(DIM);
+    let hl = Style::default().bg(Color::Rgb(0x2a, 0x2e, 0x42));
+    let sel = app.selected.min(chips.len().saturating_sub(1));
 
     let mut headers: Vec<&str> = vec![];
     if app.multi_host {
         headers.push("HOST");
     }
-    headers.push("CHIP");
-    headers.extend(["PID", "HBM", "USED/TOTAL"]);
-    headers.push(if multi_core { "TC Util /core" } else { "TC Util" });
+    headers.extend(["CHIP", "PID", "HBM", "USED/TOTAL", "TC Util"]);
     let header = Row::new(
         headers
             .into_iter()
@@ -287,81 +290,91 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
     )
     .height(1);
 
-    let rows: Vec<Row> = chips
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| {
-            let hbm_pct = if c.total > 0.0 { c.used / c.total * 100.0 } else { 0.0 };
-            let mut cells: Vec<Cell> = vec![];
-            if app.multi_host {
-                cells.push(Cell::from(c.host.clone()).style(Style::default().fg(Color::Gray)));
-            }
-            cells.push(Cell::from(c.chip.to_string()).style(Style::default().fg(ACCENT)));
-            cells.push(Cell::from(c.pid.clone()).style(Style::default().fg(Color::Gray)));
+    let mut rows: Vec<Row> = Vec::new();
+    for (ci, c) in chips.iter().enumerate() {
+        let has_cores = c.cores.len() > 1;
+        let expanded = app.expanded.contains(&c.chip);
+        let marker = if !has_cores {
+            " "
+        } else if expanded {
+            "▼"
+        } else {
+            "▶"
+        };
+        let hbm_pct = if c.total > 0.0 { c.used / c.total * 100.0 } else { 0.0 };
+        let maxd = c.cores.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
 
-            if c.metrics_ok {
-                cells.push(
-                    Cell::from(format!("{} {:>3.0}%", bar(hbm_pct, 8), hbm_pct))
-                        .style(Style::default().fg(util_color(hbm_pct))),
-                );
-                cells.push(
-                    Cell::from(format!("{:.1}/{:.0} GiB", c.used / GIB, c.total / GIB))
-                        .style(Style::default().fg(Color::Gray)),
-                );
-                // 每 core 的 duty
-                let txt = c
-                    .cores
-                    .iter()
-                    .map(|(id, d)| {
-                        if multi_core {
-                            format!("c{id}:{d:>3.0}%")
-                        } else {
-                            format!("{d:>3.0}%")
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                let maxd = c.cores.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
-                cells.push(Cell::from(txt).style(Style::default().fg(util_color(maxd))));
+        let mut cells: Vec<Cell> = vec![];
+        if app.multi_host {
+            cells.push(Cell::from(c.host.clone()).style(gray));
+        }
+        cells.push(Cell::from(format!("{marker} {}", c.chip)).style(Style::default().fg(ACCENT)));
+        cells.push(Cell::from(c.pid.clone()).style(gray));
+        if c.metrics_ok {
+            cells.push(
+                Cell::from(format!("{} {:>3.0}%", bar(hbm_pct, 8), hbm_pct))
+                    .style(Style::default().fg(util_color(hbm_pct))),
+            );
+            cells.push(Cell::from(format!("{:.1}/{:.0} GiB", c.used / GIB, c.total / GIB)).style(gray));
+            let lbl = if has_cores && !expanded {
+                format!("{} {:>3.0}% (max of {})", bar(maxd, 6), maxd, c.cores.len())
             } else {
-                cells.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(Style::default().fg(DIM)));
-                cells.push(
-                    Cell::from(format!("—/{:.0} GiB", c.total / GIB)).style(Style::default().fg(DIM)),
-                );
-                let txt = c
-                    .cores
-                    .iter()
-                    .map(|(id, _)| if multi_core { format!("c{id}:  0%") } else { "  0%".into() })
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                cells.push(Cell::from(txt).style(Style::default().fg(DIM)));
-            }
-
-            let base = if idx % 2 == 1 {
-                Style::default().bg(Color::Rgb(0x1b, 0x1d, 0x2b))
-            } else {
-                Style::default()
+                format!("{} {:>3.0}%", bar(maxd, 8), maxd)
             };
-            Row::new(cells).height(1).style(base)
-        })
-        .collect();
+            cells.push(Cell::from(lbl).style(Style::default().fg(util_color(maxd))));
+        } else {
+            cells.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(dim));
+            cells.push(Cell::from(format!("—/{:.0} GiB", c.total / GIB)).style(dim));
+            cells.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(dim));
+        }
+        let mut row = Row::new(cells).height(1);
+        if ci == sel {
+            row = row.style(hl);
+        }
+        rows.push(row);
+
+        // 展开:每个 core 一行(树状)
+        if expanded && has_cores {
+            let n = c.cores.len();
+            for (i, (id, duty)) in c.cores.iter().enumerate() {
+                let glyph = if i == n - 1 { "└─" } else { "├─" };
+                let mut cc: Vec<Cell> = vec![];
+                if app.multi_host {
+                    cc.push(Cell::from(""));
+                }
+                cc.push(Cell::from(format!("  {glyph} c{id}")).style(dim));
+                cc.push(Cell::from("")); // PID
+                cc.push(Cell::from("")); // HBM
+                cc.push(Cell::from("")); // used/total
+                if c.metrics_ok {
+                    cc.push(
+                        Cell::from(format!("{} {:>3.0}%", bar(*duty, 8), duty))
+                            .style(Style::default().fg(util_color(*duty))),
+                    );
+                } else {
+                    cc.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(dim));
+                }
+                rows.push(Row::new(cc).height(1));
+            }
+        }
+    }
 
     let mut widths = vec![];
     if app.multi_host {
         widths.push(Constraint::Length(18));
     }
     widths.extend([
-        Constraint::Length(5),  // CHIP
+        Constraint::Length(7),  // CHIP (含 marker)
         Constraint::Length(8),  // PID
         Constraint::Length(14), // HBM bar
         Constraint::Length(14), // used/total
-        Constraint::Min(16),    // TC Util per core
+        Constraint::Min(20),    // TC Util
     ]);
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .block(block(" Chips (per-core TC Util) "));
+        .block(block(" Chips  [up/down select · Enter/-> expand · <- collapse] "));
     f.render_widget(table, area);
 }
 

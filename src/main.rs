@@ -171,6 +171,8 @@ fn run_tui(cli: &Cli, addrs: Vec<String>, rt: tokio::runtime::Runtime) -> anyhow
     let multi_host = addrs.len() > 1;
     let mut duty_hist: VecDeque<u64> = VecDeque::with_capacity(HIST_LEN);
     let mut hbm_hist: VecDeque<u64> = VecDeque::with_capacity(HIST_LEN);
+    let mut selected: usize = 0;
+    let mut expanded: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -191,6 +193,16 @@ fn run_tui(cli: &Cli, addrs: Vec<String>, rt: tokio::runtime::Runtime) -> anyhow
             let owners = device::chip_owners();
             let (procs, io) = sysmon.sample(&owners);
 
+            // 芯片列表(id + core 数),用于选择/折叠
+            let chip_meta: Vec<(i64, usize)> = ui::group_by_chip(&rows)
+                .iter()
+                .map(|c| (c.chip, c.cores.len()))
+                .collect();
+            let n_chips = chip_meta.len();
+            if n_chips > 0 && selected >= n_chips {
+                selected = n_chips - 1;
+            }
+
             let app = App {
                 chip: chip.clone(),
                 chips,
@@ -205,15 +217,46 @@ fn run_tui(cli: &Cli, addrs: Vec<String>, rt: tokio::runtime::Runtime) -> anyhow
                 io,
                 uptime_secs,
                 slice_error,
+                selected,
+                expanded: expanded.clone(),
             };
             terminal.draw(|f| ui::draw(f, &app))?;
 
             if event::poll(interval)? {
                 if let Event::Key(k) = event::read()? {
-                    let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                        || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
+                    use KeyCode::*;
+                    let quit = matches!(k.code, Char('q') | Esc)
+                        || (k.code == Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
                     if quit {
                         break;
+                    }
+                    match k.code {
+                        Up | Char('k') => selected = selected.saturating_sub(1),
+                        Down | Char('j') => {
+                            if n_chips > 0 && selected + 1 < n_chips {
+                                selected += 1;
+                            }
+                        }
+                        Enter | Char(' ') => {
+                            if let Some(&(id, nc)) = chip_meta.get(selected) {
+                                if nc > 1 && !expanded.remove(&id) {
+                                    expanded.insert(id);
+                                }
+                            }
+                        }
+                        Right | Char('l') => {
+                            if let Some(&(id, nc)) = chip_meta.get(selected) {
+                                if nc > 1 {
+                                    expanded.insert(id);
+                                }
+                            }
+                        }
+                        Left | Char('h') => {
+                            if let Some(&(id, _)) = chip_meta.get(selected) {
+                                expanded.remove(&id);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
