@@ -53,11 +53,13 @@ pub fn detect() -> DeviceInfo {
             }
         }
     }
-    let dpc = chip.as_ref().map(|c| c.devices_per_chip as usize).unwrap_or(1);
+    // PCI 匹配到的 function 数 = core 数(v6e 每芯片 1、v7x 每芯片 2 个 function/core)。
+    // 物理芯片数 = cores / 每芯片 core 数。
+    let dpc = chip.as_ref().map(|c| c.devices_per_chip as usize).unwrap_or(1).max(1);
     DeviceInfo {
         chip,
-        chips: count,
-        cores: count * dpc,
+        chips: count / dpc,
+        cores: count,
     }
 }
 
