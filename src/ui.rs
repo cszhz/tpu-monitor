@@ -31,7 +31,7 @@ pub struct ChipRow {
     pub used: f64,
     pub total: f64,
     pub metrics_ok: bool,
-    pub cores: Vec<(i64, f64)>, // (core_id, duty%)
+    pub cores: Vec<(i64, f64, f64, f64)>, // (core_id, duty%, used_bytes, total_bytes)
 }
 
 /// 把每 core 的 DevRow 聚合成每芯片的 ChipRow(保序)。
@@ -48,7 +48,7 @@ pub fn group_by_chip(rows: &[DevRow]) -> Vec<ChipRow> {
                     c.used = c.used.max(r.used);
                     c.total = c.total.max(r.total);
                 }
-                c.cores.push((r.dev, r.duty));
+                c.cores.push((r.dev, r.duty, r.used, r.total));
             }
             None => out.push(ChipRow {
                 host: r.host.clone(),
@@ -57,7 +57,7 @@ pub fn group_by_chip(rows: &[DevRow]) -> Vec<ChipRow> {
                 used: r.used,
                 total: r.total,
                 metrics_ok: r.metrics_ok,
-                cores: vec![(r.dev, r.duty)],
+                cores: vec![(r.dev, r.duty, r.used, r.total)],
             }),
         }
     }
@@ -302,7 +302,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
             "▶"
         };
         let hbm_pct = if c.total > 0.0 { c.used / c.total * 100.0 } else { 0.0 };
-        let maxd = c.cores.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
+        let maxd = c.cores.iter().map(|(_, d, _, _)| *d).fold(0.0_f64, f64::max);
 
         let mut cells: Vec<Cell> = vec![];
         if app.multi_host {
@@ -336,7 +336,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
         // 展开:每个 core 一行(树状)
         if expanded && has_cores {
             let n = c.cores.len();
-            for (i, (id, duty)) in c.cores.iter().enumerate() {
+            for (i, (id, duty, used, total)) in c.cores.iter().enumerate() {
                 let glyph = if i == n - 1 { "└─" } else { "├─" };
                 let mut cc: Vec<Cell> = vec![];
                 if app.multi_host {
@@ -344,14 +344,22 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
                 }
                 cc.push(Cell::from(format!("  {glyph} c{id}")).style(dim));
                 cc.push(Cell::from("")); // PID
-                cc.push(Cell::from("")); // HBM
-                cc.push(Cell::from("")); // used/total
                 if c.metrics_ok {
+                    let pct = if *total > 0.0 { used / total * 100.0 } else { 0.0 };
+                    cc.push(
+                        Cell::from(format!("{} {:>3.0}%", bar(pct, 8), pct))
+                            .style(Style::default().fg(util_color(pct))),
+                    );
+                    cc.push(
+                        Cell::from(format!("{:.1}/{:.0} GiB", used / GIB, total / GIB)).style(dim),
+                    );
                     cc.push(
                         Cell::from(format!("{} {:>3.0}%", bar(*duty, 8), duty))
                             .style(Style::default().fg(util_color(*duty))),
                     );
                 } else {
+                    cc.push(Cell::from("").style(dim)); // HBM
+                    cc.push(Cell::from("").style(dim)); // used/total
                     cc.push(Cell::from(format!("{}   0%", bar(0.0, 8))).style(dim));
                 }
                 rows.push(Row::new(cc).height(1));

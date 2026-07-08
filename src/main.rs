@@ -50,6 +50,9 @@ struct Cli {
     /// (static mode) also print the command line of TPU-holding processes
     #[arg(long)]
     procs: bool,
+    /// dump raw per-core metrics (device_id, chip, HBM, duty) and exit
+    #[arg(long)]
+    raw: bool,
 }
 
 fn normalize(addr: &str) -> String {
@@ -312,7 +315,7 @@ fn print_once(cli: &Cli, addrs: &[String], rt: &tokio::runtime::Runtime) {
             let txt = c
                 .cores
                 .iter()
-                .map(|(id, d)| if multi_core { format!("c{id}:{d:.0}") } else { format!("{d:.0}") })
+                .map(|(id, d, _, _)| if multi_core { format!("c{id}:{d:.0}") } else { format!("{d:.0}") })
                 .collect::<Vec<_>>()
                 .join("  ");
             cells.push(txt);
@@ -321,7 +324,7 @@ fn print_once(cli: &Cli, addrs: &[String], rt: &tokio::runtime::Runtime) {
             let txt = c
                 .cores
                 .iter()
-                .map(|(id, _)| if multi_core { format!("c{id}:0") } else { "0".into() })
+                .map(|(id, _, _, _)| if multi_core { format!("c{id}:0") } else { "0".into() })
                 .collect::<Vec<_>>()
                 .join("  ");
             cells.push(txt);
@@ -389,6 +392,18 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+
+    if cli.raw {
+        let (rows, _, _, _, _, _) = collect_rows(&addrs, &rt);
+        println!("core  chip  used_GiB  total_GiB  duty%  ok");
+        for r in &rows {
+            println!(
+                "{:<5} {:<5} {:>8.2} {:>10.2} {:>6.1}  {}",
+                r.dev, r.chip, r.used / GIB, r.total / GIB, r.duty, r.metrics_ok
+            );
+        }
+        return Ok(());
+    }
 
     if cli.watch.is_some() {
         run_tui(&cli, addrs, rt)?;
