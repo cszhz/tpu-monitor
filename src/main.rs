@@ -117,7 +117,7 @@ fn collect_rows(
             let dev = i as i64;
             let pid = if is_local {
                 owners
-                    .get(&format!("/dev/vfio/{i}"))
+                    .get(&dev)
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into())
             } else {

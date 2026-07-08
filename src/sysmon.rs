@@ -215,20 +215,18 @@ impl SysMon {
         Some((rx, tx))
     }
 
-    /// 采集一轮。owners: {设备路径 -> pid}。返回按 CPU% 降序的进程列表 + I/O。
-    pub fn sample(&mut self, owners: &BTreeMap<String, i32>) -> (Vec<ProcInfo>, IoStats) {
+    /// 采集一轮。owners: {device_id -> pid}。返回按 CPU% 降序的进程列表 + I/O。
+    pub fn sample(&mut self, owners: &BTreeMap<i64, i32>) -> (Vec<ProcInfo>, IoStats) {
         let now = Instant::now();
         let dt = self
             .prev_instant
             .map(|p| now.duration_since(p).as_secs_f64())
             .unwrap_or(0.0);
 
-        // pid -> 持有的设备号
+        // pid -> 持有的 device_id
         let mut pid_devs: HashMap<i32, Vec<i64>> = HashMap::new();
-        for (path, pid) in owners {
-            if let Some(n) = path.rsplit('/').next().and_then(|s| s.parse::<i64>().ok()) {
-                pid_devs.entry(*pid).or_default().push(n);
-            }
+        for (dev, pid) in owners {
+            pid_devs.entry(*pid).or_default().push(*dev);
         }
 
         let mut procs = Vec::new();

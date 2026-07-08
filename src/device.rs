@@ -1,5 +1,5 @@
 //! 静态 TPU 信息:纯读 /sys 和 /proc,不依赖任何运行时服务。
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
 #[derive(Clone, Debug)]
@@ -63,10 +63,57 @@ pub fn detect() -> DeviceInfo {
     }
 }
 
-/// 扫描 /proc/*/fd,找出打开了 /dev/vfio/N 或 /dev/accelN 的进程。
-/// 返回 {设备路径 -> PID}。读取其他用户的 fd 需要 root,否则会被静默跳过。
-pub fn chip_owners() -> BTreeMap<String, i32> {
+/// TPU 芯片的 PCI 地址,按地址排序;下标即 device_id(libtpu 按 PCI/BDF 序枚举)。
+fn tpu_pci_sorted() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") {
+        for e in entries.flatten() {
+            let p = e.path();
+            if fs::read_to_string(p.join("vendor")).unwrap_or_default().trim() != GOOGLE_VENDOR {
+                continue;
+            }
+            let did = fs::read_to_string(p.join("device")).unwrap_or_default();
+            let sub = fs::read_to_string(p.join("subsystem_device")).unwrap_or_default();
+            if chip_from_ids(did.trim(), sub.trim()).is_some() {
+                v.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    v.sort();
+    v
+}
+
+/// vfio group 号 -> device_id。路径:iommu_groups/<g>/devices/<PCI> → PCI 排序下标。
+/// 建不出映射(无 iommu_groups / PCI 对不上)则返回空 → 上层 fallback 到 "-"。
+fn vfio_group_to_device() -> HashMap<String, i64> {
+    let sorted = tpu_pci_sorted();
+    let pci_to_dev: HashMap<&str, i64> =
+        sorted.iter().enumerate().map(|(i, a)| (a.as_str(), i as i64)).collect();
+    let mut m = HashMap::new();
+    if let Ok(groups) = fs::read_dir("/sys/kernel/iommu_groups") {
+        for g in groups.flatten() {
+            let gid = g.file_name().to_string_lossy().into_owned();
+            if let Ok(devs) = fs::read_dir(g.path().join("devices")) {
+                for d in devs.flatten() {
+                    let pci = d.file_name().to_string_lossy().into_owned();
+                    if let Some(&dev) = pci_to_dev.get(pci.as_str()) {
+                        m.insert(gid.clone(), dev);
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+/// 扫描 /proc/*/fd,找出持有 TPU vfio 设备的进程,映射到 device_id。
+/// 返回 {device_id -> PID}。读取其他用户 fd 需要相应权限,否则该进程被静默跳过。
+pub fn chip_owners() -> BTreeMap<i64, i32> {
     let mut owners = BTreeMap::new();
+    let g2d = vfio_group_to_device();
+    if g2d.is_empty() {
+        return owners; // 无法可靠映射 vfio→芯片,宁可不显示也不乱标
+    }
     let procs = match fs::read_dir("/proc") {
         Ok(p) => p,
         Err(_) => return owners,
@@ -76,19 +123,14 @@ pub fn chip_owners() -> BTreeMap<String, i32> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let fd_dir = pe.path().join("fd");
-        if let Ok(fds) = fs::read_dir(&fd_dir) {
+        if let Ok(fds) = fs::read_dir(pe.path().join("fd")) {
             for fd in fds.flatten() {
                 if let Ok(target) = fs::read_link(fd.path()) {
-                    let t = target.to_string_lossy().to_string();
-                    let is_tpu = t.starts_with("/dev/vfio/") || t.starts_with("/dev/accel");
-                    let ends_num = t
-                        .rsplit('/')
-                        .next()
-                        .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                        .unwrap_or(false);
-                    if is_tpu && ends_num {
-                        owners.insert(t, pid);
+                    let t = target.to_string_lossy();
+                    if let Some(grp) = t.strip_prefix("/dev/vfio/") {
+                        if let Some(&dev) = g2d.get(grp) {
+                            owners.entry(dev).or_insert(pid);
+                        }
                     }
                 }
             }
